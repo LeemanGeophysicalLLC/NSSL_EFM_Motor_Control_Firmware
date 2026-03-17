@@ -51,7 +51,7 @@ void resetSettings() {
   memset(&settings, 0, sizeof(settings));
   settings.power_cycle_count = 1;
   settings.log_head_index = 0;
-  settings.current_limit_ma = 300;
+  settings.current_limit_ma = 800;
   settings.pid_kp = 0.02;
   settings.pid_ki = 0.05;
   settings.pid_kd = 0.0;

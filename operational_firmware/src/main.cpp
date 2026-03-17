@@ -7,7 +7,7 @@
  * rotating shaft. The average RPM over several seconds is maintained with new
  * readings being rejected a spurious if they fall outside the average.
  * 
- * The loop runs the PID controller that updates the PWM to the motor every 200ms.
+ * The loop runs the PID controller that updates the PWM to the motor.
  * Pulses from the hall-effect sensor trigger an ISR that determines the time that
  * revolution took at adds it to the moving average of RPM assuming that it is not
  * more than 10% different from the average. This should help eliminate any signals
@@ -23,9 +23,22 @@
 #include "logging.h"
 #include <Adafruit_FRAM_SPI.h>
 #include "Cmd.h"
+#include <errno.h>
+#include <math.h>   // isnan, isinf
 
 #define FIRMWARE_MAJOR 1
-#define FIRMWARE_MINOR 0
+#define FIRMWARE_MINOR 1
+
+/*
+ * Calibrations
+ */
+const float voltage_calibration_slope = 1.03;
+const float voltage_calibration_offset = -104;
+const float current_calibration_slope = 1.38;
+const float current_calibration_offset = -175;
+ /*
+  * End Calibrations
+  */
 
 const int RPM_MIN = 60;
 const int RPM_MAX = 300;
@@ -73,6 +86,23 @@ uint16_t ReadBatteryVoltage();
 void AttachEncoderInterrupt();
 void DetachEncoderInterrupt();
 float RPMCheck(uint32_t count_interval_ms);
+
+static bool parse_strict_float(const char* s, float& out) {
+  if (s == nullptr || *s == '\0') return false;
+
+  errno = 0;
+  char* end = nullptr;
+  double v = strtod(s, &end);
+
+  // Must consume the entire token, no trailing junk
+  if (end == s || (end && *end != '\0')) return false;
+
+  if (errno == ERANGE || isnan(v) || isinf(v)) return false;
+
+  // Optional: enforce a representable float range if needed
+  out = static_cast<float>(v);
+  return true;
+}
 
 /**
  * @brief Sets the RGB LED to the specified color.
@@ -152,14 +182,19 @@ void CmdSetRPM(int arg_cnt, char **args) {
  */
 void CmdSetKP(int arg_cnt, char **args) {
   if (!CheckArgCount(2, arg_cnt)) { cmdError(); return; }
-  float kp = atof(args[1]);
+
+  float kp = 0.0f;
+  if (!parse_strict_float(args[1], kp)) { cmdError(); return; }
+
   if (kp < PID_SETTING_MIN || kp > PID_SETTING_MAX) { cmdError(); return; }
+
   settings.pid_kp = kp;
   pid_kp = kp;
   motor_pid.SetTunings(pid_kp, pid_ki, pid_kd);
   saveSettings(fram);
   cmdOk();
 }
+
 
 /**
  * @brief Command: DUMPLOG
@@ -176,9 +211,22 @@ void CmdDumpLog(int arg_cnt, char **args)
  * Sets the PID integral gain.
  */
 void CmdSetKI(int arg_cnt, char **args) {
-  if (!CheckArgCount(2, arg_cnt)) { cmdError(); return; }
-  float ki = atof(args[1]);
-  if (ki < PID_SETTING_MIN|| ki > PID_SETTING_MAX) { cmdError(); return; }
+  if (!CheckArgCount(2, arg_cnt)) { 
+    cmdError(); 
+    return; 
+  }
+
+  float ki = 0.0f;
+  if (!parse_strict_float(args[1], ki)) {
+    cmdError();
+    return;
+  }
+
+  if (ki < PID_SETTING_MIN || ki > PID_SETTING_MAX) {
+    cmdError();
+    return;
+  }
+
   settings.pid_ki = ki;
   pid_ki = ki;
   motor_pid.SetTunings(pid_kp, pid_ki, pid_kd);
@@ -191,15 +239,30 @@ void CmdSetKI(int arg_cnt, char **args) {
  * Sets the PID derivative gain.
  */
 void CmdSetKD(int arg_cnt, char **args) {
-  if (!CheckArgCount(2, arg_cnt)) { cmdError(); return; }
-  float kd = atof(args[1]);
-  if (kd < PID_SETTING_MIN || kd > PID_SETTING_MAX) { cmdError(); return; }
+  if (!CheckArgCount(2, arg_cnt)) {
+    cmdError();
+    return;
+  }
+
+  float kd = 0.0f;
+  if (!parse_strict_float(args[1], kd)) {
+    // Rejects "", "???", "0.05abc", NaN/Inf, etc.
+    cmdError();
+    return;
+  }
+
+  if (kd < PID_SETTING_MIN || kd > PID_SETTING_MAX) {
+    cmdError();
+    return;
+  }
+
   settings.pid_kd = kd;
   pid_kd = kd;
   motor_pid.SetTunings(pid_kp, pid_ki, pid_kd);
   saveSettings(fram);
   cmdOk();
 }
+
 
 /**
  * @brief Command: SETCURRENTLIM <milliamps>
@@ -232,13 +295,22 @@ void CmdSetCutoff(int arg_cnt, char **args)
     return;
   }
 
-  int val = atoi(args[1]);
+  errno = 0;
+  char *end = nullptr;
+  long val = strtol(args[1], &end, 10);
+
+  // Must consume entire token and be within [0,1]
+  if (end == args[1] || *end != '\0' || errno != 0) {
+    cmdError();
+    return;
+  }
+
   if (val != 0 && val != 1) {
     cmdError();
     return;
   }
 
-  settings.current_cutoff_enabled = val;
+  settings.current_cutoff_enabled = static_cast<int>(val);
   saveSettings(fram);
   cmdOk();
 }
@@ -248,10 +320,27 @@ void CmdSetCutoff(int arg_cnt, char **args)
  * Enables or disables automatic restart after stall.
  */
 void CmdSetRestart(int arg_cnt, char **args) {
-  if (!CheckArgCount(2, arg_cnt)) { cmdError(); return; }
-  int val = atoi(args[1]);
-  if (val != 0 && val != 1) { cmdError(); return; }
-  settings.restart_enabled = val;
+  if (!CheckArgCount(2, arg_cnt)) {
+    cmdError();
+    return;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  long val = strtol(args[1], &end, 10);
+
+  // Must consume entire token, no errors, and only 0 or 1 allowed
+  if (end == args[1] || *end != '\0' || errno != 0) {
+    cmdError();
+    return;
+  }
+
+  if (val != 0 && val != 1) {
+    cmdError();
+    return;
+  }
+
+  settings.restart_enabled = static_cast<int>(val);
   saveSettings(fram);
   cmdOk();
 }
@@ -284,12 +373,12 @@ void CmdResetConfig(int arg_cnt, char **args) {
  */
 void CmdHelp(int arg_cnt, char **args) {
   Serial.println("Available Commands:");
-  Serial.println("  SETRPM <value>         - Set RPM target (60–300)");
+  Serial.println("  SETRPM <value>         - Set RPM target (60-300)");
   Serial.println("  SETKP <float>          - Set Kp gain");
   Serial.println("  SETKI <float>          - Set Ki gain");
   Serial.println("  SETKD <float>          - Set Kd gain");
   Serial.println("  SETCUTOFF <0|1>        - Enable (1) or disable (0) current cutoff protection");
-  Serial.println("  SETCURRENTLIM <mA>     - Set current limit (100–1000 mA)");
+  Serial.println("  SETCURRENTLIM <mA>     - Set current limit (100-1000 mA)");
   Serial.println("  SETRESTART <0|1>       - Enable (1) or disable (0) auto-restart");
   Serial.println("  SHOW                   - Display current settings");
   Serial.println("  RESETCONFIG            - Reset settings to factory defaults");
@@ -360,14 +449,16 @@ uint16_t CurrentSafetyCheck(uint16_t current_limit_milliamps)
    * @param current_limit_milliamps Shutdown threshold in milliamps.
    * @return uint16_t Current in milliamps.
  */
-  uint16_t voltage = 0;
+  float voltage = 0;
   for (int i=0; i<10; i++)
   {
     voltage += analogRead(PIN_CURRENT_SENSE);
   }
   voltage /= 10;
+  voltage = voltage * (3.3 / 4096.0);
   // Current = voltage / (Rs * Rl)
-  uint16_t current = voltage * 322 / 1000;
+  float current_uncal = voltage * 1000;
+  uint16_t current = static_cast<uint16_t>(current_uncal * current_calibration_slope + current_calibration_offset);
   if ((current >= current_limit_milliamps) && settings.current_cutoff_enabled)
   {
     Serial.print("Current limit encountered: ");
@@ -394,8 +485,8 @@ uint16_t ReadBatteryVoltage()
   const float volts_per_count = vref / 4095.0;    // 12-bit ADC resolution
 
   int raw = analogRead(PIN_VBAT_SENSE);
-  float voltage = raw * volts_per_count * scale_factor;
-  return static_cast<uint16_t>(voltage * 1000.0); // Convert to millivolts
+  float voltage = raw * volts_per_count * scale_factor * 1000; // to millivolts
+  return static_cast<uint16_t>(voltage * voltage_calibration_slope + voltage_calibration_offset);
 }
 
 /**
@@ -467,6 +558,7 @@ void setup()
    * 
    * This runs once at boot and sets up all of the pin states, classes we'll need, etc.
    */
+  analogReadResolution(12);
   pinMode(PIN_MOTOR_ENCODER_A, INPUT);
   pinMode(PIN_MOTOR_ENCODER_B, INPUT);
   pinMode(PIN_LED_RED, OUTPUT);
@@ -583,23 +675,36 @@ void loop()
   cmdPoll();
 
   // Check the current draw
-  uint16_t current_milliamps = CurrentSafetyCheck(settings.current_limit_ma);;
+  uint16_t current_milliamps = CurrentSafetyCheck(settings.current_limit_ma);
 
   // Check the battery voltage
   uint16_t battery_voltage = ReadBatteryVoltage();
 
-  // Check if there is an update to the motor RPM
-  feedback = RPMCheck(1000);
-  feedback = int(feedback);
+  // ---- RPM handling: keep last valid + timeout ----
+  static int16_t  last_valid_rpm     = -1;
+  static uint32_t last_rpm_update_ms = 0;
 
-  if (feedback != -1)
-  {
-    motor_pid.Compute();  // Compute and update
-    temperature = readTemperature(); // Read the temperature sensor
+  const uint32_t RPM_INTERVAL_MS = 1000;  // matches RPMCheck(1000)
+  const uint32_t RPM_TIMEOUT_MS  = 3000;  // ~3 missed updates -> invalidate
+
+  float rpm_f = RPMCheck(RPM_INTERVAL_MS);
+
+  // Update feedback ONLY when we got a fresh RPM
+  if (rpm_f != -1) {
+    int16_t rpm_i = (int16_t)rpm_f;   // keep behavior similar to your int(feedback)
+    feedback = rpm_i;
+
+    last_valid_rpm = rpm_i;
+    last_rpm_update_ms = millis();
+
+    motor_pid.Compute();              // Compute and update
+    temperature = readTemperature();  // Read the temperature sensor
     analogWrite(PIN_MOTOR_PWM, pwm_output);
+
+    // Live telemetry print (only when RPM is fresh, like before)
     Serial.print(millis());
     Serial.print(",");
-    Serial.print(feedback);
+    Serial.print((int)feedback);
     Serial.print(",");
     Serial.print(settings.setpoint_rpm);
     Serial.print(",");
@@ -611,26 +716,28 @@ void loop()
     Serial.print(",");
     Serial.println(battery_voltage);
 
-    if (abs(settings.setpoint_rpm - feedback) < (settings.setpoint_rpm * 0.01))
-    {
-      // If we are within 5 RPM of the setpoint, turn on the green LED
+    if (abs(settings.setpoint_rpm - (int)feedback) < (settings.setpoint_rpm * 0.01)) {
       setRgbLedColor(0, 255, 0); // Green
-    }
-    else
-    {
-      // If we are not on target, make the LED yellow
+    } else {
       setRgbLedColor(255, 255, 0); // Yellow
     }
+  }
+
+  // Determine RPM value for logging (stale -> -1)
+  int16_t rpm_for_log = last_valid_rpm;
+  if (rpm_for_log != -1 && (millis() - last_rpm_update_ms) > RPM_TIMEOUT_MS) {
+    rpm_for_log = -1;
   }
 
   // Write data to the log every 60 seconds
   static uint32_t last_log_time = millis();
   if (millis() - last_log_time >= 60000) {
-    Serial.println("Logging data...");
     last_log_time = millis();
 
+    Serial.println("Logging data...");
+
     logData(millis() / 1000,          // Timestamp in seconds
-            feedback,                 // Current RPM
+            rpm_for_log,              // Last valid RPM, or -1 if stale
             current_milliamps,        // Current in mA
             temperature,              // Temperature degC × 10
             battery_voltage,          // mV

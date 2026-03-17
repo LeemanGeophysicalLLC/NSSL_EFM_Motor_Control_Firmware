@@ -62,7 +62,7 @@ void logData(unsigned long timestamp_s,
  * @brief Dump all logs over serial from oldest to newest
  */
 void dumpLog() {
-  Serial.println("Timestamp (s), RPM, Current (mA), Temp (degC*10), Battery (mV), PowerCycles");
+  Serial.println("Timestamp_s,RPM,Current_mA,Temp_degC*10,Battery_mV,PowerCycles");
 
   uint16_t index = settings.log_head_index;
 
